@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Tuple 
 import torch 
 import torch.nn as nn 
 from quantization import vq, vq_st
@@ -91,7 +91,7 @@ class VQVAE(nn.Module):
         x_tilde = self.decoder(z_q_x)
         return x_tilde  
     
-    def forward(self, x: torch.Tensor) -> tuple:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         z_e_x = self.encoder(x) 
         z_q_x_st, z_q_x = self.codebook.straight_through(z_e_x)
         x_tilde = self.decoder(z_q_x_st)
@@ -100,6 +100,20 @@ class VQVAE(nn.Module):
 
 
 
+def main():
+    test = torch.randn((1, 3, 64, 64))
+    print(test.size()) 
+    model = VQVAE(input_dim=3, dim=64, embed_size=512)
+    print(model)
+    x_tilde, z_e_x, z_q_x = model(test)
+    print(x_tilde.size())
+    print(z_e_x.size())
+    print(z_q_x.size())
+
+
+
+
+
+if __name__ == "__main__":
+    main() 
         
-        
-        return x 
