@@ -168,6 +168,48 @@ class ResnetBlock(nn.Module):
         return x + h 
 
 
+class Downsample(nn.Module):
+    def __init__(self, block_in: int, with_conv: bool = True) -> None:
+        super().__init__()        
+        self.with_conv = with_conv 
+        if self.with_conv: 
+            # no asymmetric padding in torch conv, so do it yourself 
+            self.conv = nn.Conv2d(
+                in_channels=block_in,
+                out_channels=block_in,
+                kernel_size=3,
+                stride=2,
+                padding=0,
+            )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor: 
+        if self.with_conv: 
+            pad = (0, 1, 0, 1)
+            x = nn.functional.pad(x, pad, mode="constant", value=0)
+            x = self.conv(x)
+        else: 
+            x = nn.functional.avg_pool2d(x, kernel_size=2, stride=2)
+        return x 
+
+
+class Upsample(nn.Module):
+    def __init__(self, in_channels: int, with_conv: bool = True) -> None: 
+        super().__init__()
+        self.with_conv = with_conv 
+        if self.with_conv: 
+            self.conv = nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=in_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor: 
+        x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
+        if self.with_conv: 
+            x = self.conv(x)
+        return x
 
 
 class Encoder(nn.Module): 
@@ -208,7 +250,65 @@ class Encoder(nn.Module):
                 if curr_resolution in cfg.attn_resolutions:
                     attn.append(AttnBlock(block_in))
 
+            down = nn.Module()
+            down.block = block 
+            down.attn = attn 
+            if level != self.num_resolutions - 1: 
+                down.downsample = Downsample(block_in)
+                curr_res = curr_res // 2 
+            self.down.append(down)
+        
+        # middle 
+        self.mid = nn.Module() 
+        self.mid.block1 = ResnetBlock(
+            in_channels=block_in,
+            out_channels=block_in,
+            temb_channels=self.timestep_embedding_channels,
+            dropout=cfg.dropout,
+        )
+        self.mid.attn1 = AttnBlock(block_in) 
+        self.mid.block2 = ResnetBlock(
+            in_channels=block_in,
+            out_channels=block_in,
+            temb_channels=self.timestep_embedding_channels,
+            dropout=cfg.dropout,
+        )
 
+        # end 
+        self.norm_out = Normalize(block_in)
+        self.conv_out = nn.Conv2d(
+            in_channels=block_in,
+            out_channels=self.config.z_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )      
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor: 
+        temb = None # timestep embedding 
+        # downsampling 
+        hs = [self.conv(x)]
+        for level in range(self.num_resolutions): 
+            for block in range(self.config.num_res_blocks):
+                h = self.down[level].block[block](hs[-1], temb)
+                if len(self.down[level].attn) > 0: 
+                    h = self.down[level].attn[block](h)
+                hs.append(h)
+            
+            if level != self.num_resolutions - 1: 
+                hs.append(self.down[level].downsample(hs[-1]))
+
+        # middle 
+        h = hs[-1]
+        h = self.mid.block1(h, temb)
+        h = self.mid.attn1(h)
+        h = self.mid.block2(h, temb)
+
+        # end 
+        h = self.norm_out(h)
+        h = swish(h)
+        h = self.conv_out(h)
+        return h 
 
 class Decoder(nn.Module):
     def __init__(self, cfg: TokenizerConfig) -> None: 
