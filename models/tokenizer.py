@@ -7,28 +7,18 @@ from perceptual_loss import PerceptualLoss
 Batch = Dict[str, torch.Tensor]
 
 @dataclass
-class EncoderConfig:
-    z_channels: int 
-    ch_mult: List[int]
-    in_channels: int 
-    out_channels: int 
-    num_res_blocks: int     
-
-@dataclass 
-class DecoderConfig:
-    z_channels: int 
-
-
-@dataclass
 class TokenizerConfig: 
     resolution: int 
     vocab_size: int 
     embed_dim: int 
-    encoder_cfg: EncoderConfig
-    decoder_cfg: DecoderConfig
+    z_channels: int 
+    ch_mult: List[int] 
+    ch: int 
+    in_channels: int  
+    num_res_blocks: int 
     dropout: float 
     attn_resolutions: List[int]
-
+    
 
 class LossWithIntermediateLosses:
     def __init__(self, **kwargs):
@@ -215,14 +205,14 @@ class Upsample(nn.Module):
 class Encoder(nn.Module): 
     def __init__(self, cfg: TokenizerConfig) -> None: 
         super().__init__()
-        self.config = cfg.encoder_cfg 
+        self.config = cfg
         self.num_resolutions = len(self.config.ch_mult)
-        self.timestep_embedding_channels = 0 
+        self.temb = 0 # timestep embedding channels 
 
         # downsampling 
         self.conv = nn.Conv2d(
             self.config.in_channels, 
-            self.config.out_channels, 
+            self.config.ch, 
             kernel_size=3, 
             stride=1,
             padding=1,
@@ -234,15 +224,15 @@ class Encoder(nn.Module):
         for level in range(self.num_resolutions):
             block = nn.ModuleList()
             attn = nn.ModuleList()
-            block_in = self.config.out_channels * in_ch_mult[level]
-            block_out = self.config.out_channels * self.config.ch_mult[level]
+            block_in = self.config.ch * in_ch_mult[level]
+            block_out = self.config.ch * self.config.ch_mult[level]
 
             for b in range(self.config.num_res_blocks):
                 block.append(
                     ResnetBlock(
                         in_channels=block_in, 
                         out_channels=block_out, 
-                        temb_channels=self.timestep_embedding_channels,
+                        temb_channels=self.temb,
                         dropout=cfg.dropout
                     )
                 )
@@ -263,14 +253,14 @@ class Encoder(nn.Module):
         self.mid.block1 = ResnetBlock(
             in_channels=block_in,
             out_channels=block_in,
-            temb_channels=self.timestep_embedding_channels,
+            temb_channels=self.temb,
             dropout=cfg.dropout,
         )
         self.mid.attn1 = AttnBlock(block_in) 
         self.mid.block2 = ResnetBlock(
             in_channels=block_in,
             out_channels=block_in,
-            temb_channels=self.timestep_embedding_channels,
+            temb_channels=self.temb,
             dropout=cfg.dropout,
         )
 
@@ -310,11 +300,49 @@ class Encoder(nn.Module):
         h = self.conv_out(h)
         return h 
 
+
 class Decoder(nn.Module):
     def __init__(self, cfg: TokenizerConfig) -> None: 
         super().__init__()
-        self.config = cfg.decoder_cfg 
+        self.config = cfg
+        self.temb = 0 
+        self.num_resolutions = len(self.config.ch_mult)
+        # compute in_ch_mult, block_in and curr_res at lowest res 
+        in_ch_mult = (1,) + tuple(self.config.ch_mult)
+        block_in = self.config.ch * self.config.ch_mult[self.num_resolutions - 1]
+        curr_res = self.config.resolution // 2 ** (self.num_resolutions - 1)
+        print(f"Tokenizer: shape of latent is {self.config.z_channels, curr_res, curr_res}.")
 
+        # z to block in 
+        self.conv_in = nn.Conv2d(
+            in_channels=self.config.z_channels,
+            out_channels=block_in,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
+        # middle 
+        self.mid = nn.Module()
+        self.mid.block1 = ResnetBlock(
+            in_channels=block_in,
+            out_channels=block_in,
+            temb_channels=self.temb,
+            dropout=self.config.dropout,
+        )
+        self.mid.attn1 = AttnBlock(block_in)
+        self.mid.block2 = ResnetBlock(
+            in_channels=block_in,
+            out_channels=block_in,
+            temb_channels=self.temb,
+            dropout=self.config.dropout,
+        )
+
+        # upsampling 
+        self.up = nn.ModuleList()
+
+
+def forward(self, x: torch.Tensor) -> torch.Tensor: 
+    ...
 
 
 class Tokenizer(nn.Module):
