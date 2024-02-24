@@ -14,7 +14,8 @@ class TokenizerConfig:
     z_channels: int 
     ch_mult: List[int] 
     ch: int 
-    in_channels: int  
+    in_channels: int 
+    out_channels: int  
     num_res_blocks: int 
     dropout: float 
     attn_resolutions: List[int]
@@ -102,8 +103,8 @@ class ResnetBlock(nn.Module):
             self, 
             in_channels: int, 
             out_channels: int, 
-            conv_shortcut: False, 
             dropout: float, 
+            conv_shortcut: bool = False, 
             temb_channels: int = 512,
         ) -> None: 
         super().__init__()
@@ -219,6 +220,7 @@ class Encoder(nn.Module):
         ) 
         curr_resolution = cfg.resolution
         in_ch_mult = (1,) + tuple(self.config.ch_mult)
+        block_in = None
         self.down = nn.ModuleList()
 
         for level in range(self.num_resolutions):
@@ -245,10 +247,11 @@ class Encoder(nn.Module):
             down.attn = attn 
             if level != self.num_resolutions - 1: 
                 down.downsample = Downsample(block_in)
-                curr_res = curr_res // 2 
+                curr_resolution = curr_resolution // 2 
             self.down.append(down)
         
         # middle 
+        assert block_in is not None 
         self.mid = nn.Module() 
         self.mid.block1 = ResnetBlock(
             in_channels=block_in,
@@ -307,8 +310,9 @@ class Decoder(nn.Module):
         self.config = cfg
         self.temb = 0 
         self.num_resolutions = len(self.config.ch_mult)
+        # INFO this seems to be not needed?
         # compute in_ch_mult, block_in and curr_res at lowest res 
-        in_ch_mult = (1,) + tuple(self.config.ch_mult)
+        # in_ch_mult = (1,) + tuple(self.config.ch_mult)
         block_in = self.config.ch * self.config.ch_mult[self.num_resolutions - 1]
         curr_res = self.config.resolution // 2 ** (self.num_resolutions - 1)
         print(f"Tokenizer: shape of latent is {self.config.z_channels, curr_res, curr_res}.")
@@ -339,18 +343,63 @@ class Decoder(nn.Module):
 
         # upsampling 
         self.up = nn.ModuleList()
+        for i_level in reversed(range(self.num_resolutions)):
+            block = nn.ModuleList()
+            attn = nn.ModuleList()
+            block_out = cfg.ch * cfg.ch_mult[i_level]
+            for _ in range(cfg.num_res_blocks + 1): 
+                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out, temb_channels=self.temb, dropout=cfg.dropout))
+                block_in = block_out
+                if curr_res in cfg.attn_resolutions: 
+                    attn.append(AttnBlock(block_in))
+
+            up = nn.Module()
+            up.block = block 
+            up.attn = attn 
+            if i_level != 0: 
+                up.upsample = Upsample(block_in, with_conv=True)
+                curr_res = curr_res * 2 
+            self.up.insert(0, up) # prepend to get consistent order 
+
+        # end 
+        self.norm_out = Normalize(block_in)
+        self.conv_out = nn.Conv2d(
+            block_in, cfg.out_channels, kernel_size=3, stride=1, padding=1
+        )            
+
 
 
 def forward(self, x: torch.Tensor) -> torch.Tensor: 
-    ...
+    temb = None  # timestep embedding 
+    # z to block in 
+    h = self.conv_in(x)
+    # middle 
+    h = self.mid.block1(h, temb)
+    h = self.mid.attn1(h)
+    h = self.mid.block2(h, temb)
 
+    # upsampling 
+    for i_level in reversed(range(self.num_resolutions)):
+        for i_block in range(self.cfg.num_res_blocks): 
+            h = self.up[i_level].block[i_block](h, temb)
+            if len(self.up[i_level].attn) > 0: 
+                h = self.up[i_level].attn[i_block](h)
+        
+        if i_level != 0: 
+            h = self.up[i_level].upsample(h)
+
+    # end 
+    h = self.norm_out(h)
+    h = swish(h)
+    h = self.conv_out(h)
+    return h 
 
 class Tokenizer(nn.Module):
     def __init__(self, cfg: TokenizerConfig, encoder: Encoder, decoder: Decoder) -> None:
         super().__init__()
         self.vocab_size = cfg.vocab_size
         self.encoder = encoder 
-        self.pre_quant_conv = nn.Conv2d(cfg.encoder_cfg.z_channels, cfg.embed_dim, 1)
+        self.pre_quant_conv = nn.Conv2d(encoder.config.z_channels, cfg.embed_dim, 1)
         self.embedding = nn.Embedding(self.vocab_size, cfg.embed_dim)
         self.post_quant_conv = nn.Conv2d(cfg.embed_dim, cfg.decoder_cfg.z_channels, 1) 
         self.decoder = decoder
